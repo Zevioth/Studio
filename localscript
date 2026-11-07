@@ -1,0 +1,201 @@
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local function create(className, properties, parent)
+    local object = Instance.new(className)
+
+    for property, value in pairs(properties) do
+        object[property] = value
+    end
+
+    object.Parent = parent
+    return object
+end
+
+-- Screen GUI
+local screenGui = create("ScreenGui", {
+    Name = "SurvivalHUD",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = false,
+    DisplayOrder = 10
+}, playerGui)
+
+-- Main HUD
+local main = create("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(270, 104),
+    Position = UDim2.fromOffset(20, 20),
+    BackgroundColor3 = Color3.fromRGB(17, 17, 17),
+    BackgroundTransparency = 0.08,
+    BorderSizePixel = 0
+}, screenGui)
+
+create("UICorner", {
+    CornerRadius = UDim.new(0, 12)
+}, main)
+
+create("UIStroke", {
+    Color = Color3.fromRGB(55, 55, 55),
+    Thickness = 1
+}, main)
+
+create("UIPadding", {
+    PaddingTop = UDim.new(0, 11),
+    PaddingBottom = UDim.new(0, 11),
+    PaddingLeft = UDim.new(0, 13),
+    PaddingRight = UDim.new(0, 13)
+}, main)
+
+create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Vertical,
+    Padding = UDim.new(0, 10),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, main)
+
+-- Create a status bar
+local function createBar(name, order, color)
+    local section = create("Frame", {
+        Name = name,
+        Size = UDim2.new(1, 0, 0, 35),
+        BackgroundTransparency = 1,
+        LayoutOrder = order
+    }, main)
+
+    local label = create("TextLabel", {
+        Name = "Label",
+        Size = UDim2.new(0.5, 0, 0, 16),
+        BackgroundTransparency = 1,
+        Text = name:upper(),
+        TextColor3 = Color3.fromRGB(220, 220, 220),
+        TextSize = 11,
+        Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Left
+    }, section)
+
+    local value = create("TextLabel", {
+        Name = "Value",
+        Position = UDim2.new(0.5, 0, 0, 0),
+        Size = UDim2.new(0.5, 0, 0, 16),
+        BackgroundTransparency = 1,
+        Text = "100 / 100",
+        TextColor3 = Color3.fromRGB(180, 180, 180),
+        TextSize = 11,
+        Font = Enum.Font.GothamMedium,
+        TextXAlignment = Enum.TextXAlignment.Right
+    }, section)
+
+    local background = create("Frame", {
+        Name = "BarBackground",
+        Position = UDim2.new(0, 0, 0, 22),
+        Size = UDim2.new(1, 0, 0, 9),
+        BackgroundColor3 = Color3.fromRGB(48, 48, 48),
+        BorderSizePixel = 0,
+        ClipsDescendants = true
+    }, section)
+
+    create("UICorner", {
+        CornerRadius = UDim.new(1, 0)
+    }, background)
+
+    local fill = create("Frame", {
+        Name = "Fill",
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundColor3 = color,
+        BorderSizePixel = 0
+    }, background)
+
+    create("UICorner", {
+        CornerRadius = UDim.new(1, 0)
+    }, fill)
+
+    return {
+        Fill = fill,
+        Value = value
+    }
+end
+
+-- Bars
+local healthBar = createBar(
+    "Health",
+    1,
+    Color3.fromRGB(235, 235, 235)
+)
+
+local hungerBar = createBar(
+    "Hunger",
+    2,
+    Color3.fromRGB(155, 155, 155)
+)
+
+-- Smooth bar animation
+local function updateBar(bar, current, maximum)
+    maximum = math.max(maximum, 1)
+    current = math.clamp(current, 0, maximum)
+
+    local percentage = current / maximum
+
+    TweenService:Create(
+        bar.Fill,
+        TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {
+            Size = UDim2.new(percentage, 0, 1, 0)
+        }
+    ):Play()
+end
+
+-- Health updates
+local humanoid
+
+local function updateHealth()
+    if not humanoid then return end
+
+    local health = math.max(0, humanoid.Health)
+    local maxHealth = humanoid.MaxHealth
+
+    healthBar.Value.Text = string.format(
+        "%d / %d",
+        math.floor(health + 0.5),
+        math.floor(maxHealth + 0.5)
+    )
+
+    updateBar(healthBar, health, maxHealth)
+end
+
+-- Hunger updates
+local function updateHunger()
+    local hunger = player:GetAttribute("Hunger") or 100
+    local maxHunger = player:GetAttribute("MaxHunger") or 100
+
+    hungerBar.Value.Text = string.format(
+        "%.1f / %.0f",
+        hunger,
+        maxHunger
+    )
+
+    updateBar(hungerBar, hunger, maxHunger)
+end
+
+-- Character handling
+local function setupCharacter(character)
+    humanoid = character:WaitForChild("Humanoid")
+
+    humanoid.HealthChanged:Connect(updateHealth)
+
+    humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(updateHealth)
+
+    updateHealth()
+end
+
+player.CharacterAdded:Connect(setupCharacter)
+
+if player.Character then
+    setupCharacter(player.Character)
+end
+
+player:GetAttributeChangedSignal("Hunger"):Connect(updateHunger)
+player:GetAttributeChangedSignal("MaxHunger"):Connect(updateHunger)
+
+updateHunger()
