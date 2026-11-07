@@ -1,9 +1,5 @@
-local roll = math.clamp(
-    math.floor(rng:NextNumber() * 100) + 1,
-    1,
-    100
-)
+local treeIndex = math.floor(
+    rng:NextNumber() * #TreeTemplates
+) + 1
 
-if roll > chance then
-    return
-end
+local template = TreeTemplates[treeIndex]
