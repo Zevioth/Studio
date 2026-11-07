@@ -1,306 +1,989 @@
 
--- INFINITE TERRAIN GENERATOR
--- Place inside ServerScriptService
+-- INFINITE TERRAIN GENERATOR V2
+-- ServerScriptService > InfiniteTerrain
 
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
 local Terrain = Workspace.Terrain
 
+--------------------------------------------------
 -- SETTINGS
-local SEED = 58321
+--------------------------------------------------
 
-local CHUNK_SIZE = 64
+local WORLD_SEED = 58321
+
+-- Terrain generation
+local STEP_SIZE = 16
 local RESOLUTION = 4
 
-local LOAD_RADIUS = 2
+-- Loading distance (16 studs per step)
+local LOAD_RADIUS_STEPS = 8
 
+-- Number of simultaneous terrain generators
+local MAX_WORKERS = 2
+
+-- Player position checking
+local UPDATE_INTERVAL = 0.15
+
+-- Terrain height
 local MIN_Y = -64
 local MAX_Y = 192
-
 local SEA_LEVEL = 24
 
-local VOXELS = CHUNK_SIZE / RESOLUTION
-local HEIGHT_VOXELS = (MAX_Y - MIN_Y) / RESOLUTION
+-- World structure
+local WORLD_CHUNK_SIZE = 64
+local STEPS_PER_CHUNK = WORLD_CHUNK_SIZE / STEP_SIZE
 
--- CHUNK STORAGE
-local GeneratedChunks = {}
+local VOXELS_X = STEP_SIZE / RESOLUTION
+local VOXELS_Z = STEP_SIZE / RESOLUTION
+local VOXELS_Y = (MAX_Y - MIN_Y) / RESOLUTION
 
--- NOISE
-local function noise(x, z, scale, offset)
-	return math.noise(
-		x / scale,
-		z / scale,
-		SEED * 0.001 + offset
-	)
+--------------------------------------------------
+-- TERRAIN COLORS
+--------------------------------------------------
+
+Terrain:SetMaterialColor(
+    Enum.Material.Grass,
+    Color3.fromRGB(29, 77, 38)
+)
+
+Terrain:SetMaterialColor(
+    Enum.Material.Ground,
+    Color3.fromRGB(48, 75, 42)
+)
+
+Terrain.Decoration = true
+
+--------------------------------------------------
+-- REPLICATED STORAGE
+--------------------------------------------------
+
+local ChunkFolder = ReplicatedStorage:WaitForChild("Chunk")
+local NatureFolder = ChunkFolder:WaitForChild("Nature")
+
+local TreeTemplates = {
+    NatureFolder:WaitForChild("Tree1"),
+    NatureFolder:WaitForChild("Tree2"),
+    NatureFolder:WaitForChild("Tree3")
+}
+
+-- Support two possible House folder layouts.
+local function GetPath(root, names)
+
+    local current = root
+
+    for _, name in ipairs(names) do
+
+        if not current then
+            return nil
+        end
+
+        current = current:FindFirstChild(name)
+
+    end
+
+    return current
+
 end
 
--- TERRAIN HEIGHT AND BIOME
+local HouseTemplate =
+    GetPath(ReplicatedStorage, {
+        "Chunk", "Structures", "House"
+    })
+
+if not HouseTemplate then
+
+    HouseTemplate =
+        GetPath(ReplicatedStorage, {
+            "Structures", "Chunk", "Structures", "House"
+        })
+
+end
+
+if not HouseTemplate then
+
+    warn("House template not found!")
+
+else
+
+    if not HouseTemplate:IsA("Model")
+        and not HouseTemplate:IsA("BasePart") then
+
+        warn("House must be a Model or BasePart!")
+        HouseTemplate = nil
+
+    end
+
+end
+
+--------------------------------------------------
+-- GENERATED OBJECT FOLDERS
+--------------------------------------------------
+
+local function GetOrCreateFolder(parent, name)
+
+    local folder = parent:FindFirstChild(name)
+
+    if not folder then
+
+        folder = Instance.new("Folder")
+        folder.Name = name
+        folder.Parent = parent
+
+    end
+
+    return folder
+
+end
+
+local GeneratedNature =
+    GetOrCreateFolder(Workspace, "GeneratedNature")
+
+local GeneratedStructures =
+    GetOrCreateFolder(Workspace, "GeneratedStructures")
+
+--------------------------------------------------
+-- GENERATION DATA
+--------------------------------------------------
+
+local GeneratedTiles = {}
+local GeneratingTiles = {}
+local QueuedTiles = {}
+
+local AttemptedHouseChunks = {}
+
+local PendingTiles = {}
+local PlayerCenters = {}
+
+local function TileKey(x, z)
+    return x .. "," .. z
+end
+
+local function MakeSeed(x, z, salt)
+
+    local value =
+        WORLD_SEED
+        + x * 73856093
+        + z * 19349663
+        + salt * 83492791
+
+    value = math.floor(value % 2147483647)
+
+    if value <= 0 then
+        value = 1
+    end
+
+    return value
+
+end
+
+--------------------------------------------------
+-- TERRAIN HEIGHT AND BIOMES
+--------------------------------------------------
+
 local function GetTerrainData(x, z)
 
-	local continent = noise(x, z, 900, 1)
-	local detail = noise(x, z, 180, 2)
-	local biomeNoise = noise(x, z, 600, 3)
+    local continental = math.noise(
+        x / 850,
+        z / 850,
+        WORLD_SEED * 0.0001
+    )
 
-	local mountainNoise = noise(x, z, 450, 4)
+    local landMask = math.clamp(
+        (continental + 0.28) / 0.56,
+        0,
+        1
+    )
 
-	local height
-	local waterLevel = SEA_LEVEL
-	local biome
+    local hills = math.noise(
+        x / 170,
+        z / 170,
+        WORLD_SEED * 0.0002
+    )
 
-	-- OCEAN
-	if continent < -0.15 then
+    local smallDetail = math.noise(
+        x / 55,
+        z / 55,
+        WORLD_SEED * 0.0003
+    )
 
-		height = 6 + (continent + 0.15) * 35
-		height += detail * 4
+    local height =
+        -12
+        + landMask * 68
+        + hills * 10
+        + smallDetail * 2.5
 
-		biome = "Ocean"
+    local ridge = 1 - math.abs(math.noise(
+        x / 430,
+        z / 430,
+        WORLD_SEED * 0.0004
+    ))
 
-	else
+    local forest = math.noise(
+        x / 500,
+        z / 500,
+        WORLD_SEED * 0.0005
+    )
 
-		-- LAND
-		height = 24 + (continent + 0.15) * 55
-		height += detail * 10
+    local biome = "Plains"
 
-		-- MOUNTAINS
-		if mountainNoise > 0.35 then
+    -- OCEAN AND COAST
+    if landMask < 0.33 then
 
-			local mountainStrength =
-				(mountainNoise - 0.35) / 0.65
+        biome = "Ocean"
 
-			height += (mountainStrength ^ 2) * 95
+    elseif landMask < 0.68
+        or height < SEA_LEVEL + 7 then
 
-			biome = "Mountains"
+        biome = "Beach"
 
-		-- FORESTS
-		elseif biomeNoise > 0.25 then
+    else
 
-			biome = "BigForest"
-			height += detail * 5
+        -- MOUNTAINS
+        if ridge > 0.84 then
 
-		elseif biomeNoise > -0.15 then
+            local strength =
+                (ridge - 0.84) / 0.16
 
-			biome = "Forest"
+            height += strength * strength * 90
 
-		else
+            biome = "Mountains"
 
-			biome = "Plains"
+        -- FORESTS
+        elseif forest > 0.25 then
 
-		end
+            biome = "BigForest"
 
-		-- RARE LAKES
-		local lakeNoise = noise(x, z, 300, 10)
-		local lakeDetail = noise(x, z, 90, 11)
+        elseif forest > -0.20 then
 
-		if lakeNoise > 0.82
-			and continent > 0.05
-			and lakeDetail > 0.15 then
+            biome = "Forest"
 
-			height = 12 + lakeDetail * 2
-			waterLevel = 22
+        else
 
-			biome = "Lake"
+            biome = "Plains"
 
-		end
+        end
 
-	end
+        -- RARE LAKES
+        local lakeNoise = math.noise(
+            x / 320,
+            z / 320,
+            WORLD_SEED * 0.0008
+        )
 
-	-- BEACHES
-	if biome ~= "Ocean"
-		and biome ~= "Lake"
-		and height >= SEA_LEVEL - 3
-		and height <= SEA_LEVEL + 7 then
+        if lakeNoise > 0.79 and landMask > 0.85 then
 
-		biome = "Beach"
+            local lakeDetail = math.noise(
+                x / 90,
+                z / 90,
+                WORLD_SEED * 0.0009
+            )
 
-	end
+            height = SEA_LEVEL - 7 + lakeDetail * 2
 
-	height = math.clamp(height, MIN_Y, MAX_Y - 8)
+            biome = "Lake"
 
-	return height, waterLevel, biome
-end
+        end
 
--- GENERATE CHUNK
-local function GenerateChunk(chunkX, chunkZ)
+    end
 
-	local key = chunkX .. "," .. chunkZ
+    height = math.clamp(
+        height,
+        MIN_Y,
+        MAX_Y - 8
+    )
 
-	if GeneratedChunks[key] then
-		return
-	end
-
-	GeneratedChunks[key] = "Generating"
-
-	local originX = chunkX * CHUNK_SIZE
-	local originZ = chunkZ * CHUNK_SIZE
-
-	local region = Region3.new(
-		Vector3.new(originX, MIN_Y, originZ),
-		Vector3.new(
-			originX + CHUNK_SIZE,
-			MAX_Y,
-			originZ + CHUNK_SIZE
-		)
-	):ExpandToGrid(RESOLUTION)
-
-	local materials = {}
-	local occupancy = {}
-
-	-- CREATE VOXEL ARRAYS
-	for x = 1, VOXELS do
-
-		materials[x] = {}
-		occupancy[x] = {}
-
-		for y = 1, HEIGHT_VOXELS do
-
-			materials[x][y] = {}
-			occupancy[x][y] = {}
-
-		end
-	end
-
-	-- GENERATE TERRAIN
-	for x = 1, VOXELS do
-
-		for z = 1, VOXELS do
-
-			local worldX = originX + (x - 0.5) * RESOLUTION
-			local worldZ = originZ + (z - 0.5) * RESOLUTION
-
-			local surfaceHeight, waterLevel, biome =
-				GetTerrainData(worldX, worldZ)
-
-			local underwater =
-				surfaceHeight < waterLevel
-
-			for y = 1, HEIGHT_VOXELS do
-
-				local worldY =
-					MIN_Y + (y - 0.5) * RESOLUTION
-
-				local material = Enum.Material.Air
-				local amount = 0
-
-				if worldY <= surfaceHeight then
-
-					local depth = surfaceHeight - worldY
-
-					amount = 1
-
-					if biome == "Beach"
-						or biome == "Ocean"
-						or biome == "Lake" then
-
-						if depth <= 4 then
-							material = Enum.Material.Sand
-						elseif depth <= 16 then
-							material = Enum.Material.Mud
-						else
-							material = Enum.Material.Rock
-						end
-
-					else
-
-						if depth <= 4 then
-							material = Enum.Material.Ground
-						elseif depth <= 16 then
-							material = Enum.Material.Mud
-						else
-							material = Enum.Material.Rock
-						end
-
-					end
-
-				elseif underwater and worldY <= waterLevel then
-
-					material = Enum.Material.Water
-					amount = 1
-
-				end
-
-				materials[x][y][z] = material
-				occupancy[x][y][z] = amount
-
-			end
-		end
-
-		-- Prevent excessive generation spikes
-		if x % 4 == 0 then
-			task.wait()
-		end
-	end
-
-	-- WRITE TERRAIN
-	local success, err = pcall(function()
-
-		Terrain:WriteVoxels(
-			region,
-			RESOLUTION,
-			materials,
-			occupancy
-		)
-
-	end)
-
-	if success then
-
-		GeneratedChunks[key] = true
-
-	else
-
-		GeneratedChunks[key] = nil
-		warn("Chunk generation failed:", key, err)
-
-	end
+    return height, SEA_LEVEL, biome
 
 end
 
--- PLAYER CHUNK LOADING
-local function UpdatePlayerChunks(player)
+--------------------------------------------------
+-- OBJECT PLACEMENT
+--------------------------------------------------
 
-	local character = player.Character
-	if not character then return end
+local function PlaceObject(template, parent, x, y, z, rng)
 
-	local root = character:FindFirstChild("HumanoidRootPart")
-	if not root then return end
+    if not template then
+        return nil
+    end
 
-	local chunkX = math.floor(root.Position.X / CHUNK_SIZE)
-	local chunkZ = math.floor(root.Position.Z / CHUNK_SIZE)
+    local clone = template:Clone()
 
-	for x = -LOAD_RADIUS, LOAD_RADIUS do
+    -- Keep environment objects in place.
+    if clone:IsA("BasePart") then
 
-		for z = -LOAD_RADIUS, LOAD_RADIUS do
+        clone.Anchored = true
 
-			local targetX = chunkX + x
-			local targetZ = chunkZ + z
+    end
 
-			local key = targetX .. "," .. targetZ
+    for _, object in ipairs(clone:GetDescendants()) do
 
-			if not GeneratedChunks[key] then
+        if object:IsA("BasePart") then
+            object.Anchored = true
+        end
 
-				task.spawn(
-					GenerateChunk,
-					targetX,
-					targetZ
-				)
+    end
 
-			end
+    local rotation = rng:NextNumber(0, math.pi * 2)
 
-		end
-	end
+    clone:PivotTo(
+        CFrame.new(x, y, z)
+        * CFrame.Angles(0, rotation, 0)
+    )
+
+    clone.Parent = parent
+
+    return clone
 
 end
 
--- MAIN LOOP
+--------------------------------------------------
+-- TREE GENERATION
+--------------------------------------------------
+
+local function DecorateTrees(tileX, tileZ)
+
+    local originX = tileX * STEP_SIZE
+    local originZ = tileZ * STEP_SIZE
+
+    local rng = Random.new(
+        MakeSeed(tileX, tileZ, 100)
+    )
+
+    local centerHeight, _, centerBiome =
+        GetTerrainData(
+            originX + STEP_SIZE / 2,
+            originZ + STEP_SIZE / 2
+        )
+
+    local treeCount = 0
+
+    if centerBiome == "BigForest" then
+
+        treeCount = rng:NextInteger(2, 4)
+
+    elseif centerBiome == "Forest" then
+
+        treeCount = rng:NextInteger(1, 3)
+
+    elseif centerBiome == "Plains" then
+
+        if rng:NextNumber() < 0.08 then
+            treeCount = 1
+        end
+
+    elseif centerBiome == "Mountains"
+        and centerHeight < 110 then
+
+        if rng:NextNumber() < 0.20 then
+            treeCount = 1
+        end
+
+    end
+
+    local placedPositions = {}
+
+    for i = 1, treeCount do
+
+        for attempt = 1, 12 do
+
+            local x = originX + rng:NextNumber(
+                3,
+                STEP_SIZE - 3
+            )
+
+            local z = originZ + rng:NextNumber(
+                3,
+                STEP_SIZE - 3
+            )
+
+            local height, _, biome =
+                GetTerrainData(x, z)
+
+            local allowed =
+                biome == "Forest"
+                or biome == "BigForest"
+                or (biome == "Mountains" and height < 110)
+
+            -- Avoid steep slopes.
+            local nearbyHeight1 =
+                GetTerrainData(x + 4, z)
+
+            local nearbyHeight2 =
+                GetTerrainData(x, z + 4)
+
+            local flat =
+                math.abs(height - nearbyHeight1) < 6
+                and math.abs(height - nearbyHeight2) < 6
+
+            -- Avoid tree overlap.
+            local separated = true
+
+            for _, position in ipairs(placedPositions) do
+
+                if (Vector3.new(x, 0, z) - position).Magnitude < 7 then
+                    separated = false
+                    break
+                end
+
+            end
+
+            if allowed and flat and separated then
+
+                local tree = TreeTemplates[
+                    rng:NextInteger(1, #TreeTemplates)
+                ]
+
+                if tree then
+
+                    PlaceObject(
+                        tree,
+                        GeneratedNature,
+                        x,
+                        height,
+                        z,
+                        rng
+                    )
+
+                    table.insert(
+                        placedPositions,
+                        Vector3.new(x, 0, z)
+                    )
+
+                    break
+
+                end
+
+            end
+
+        end
+
+    end
+
+end
+
+--------------------------------------------------
+-- HOUSE GENERATION
+--------------------------------------------------
+
+local function GetHouseChance()
+
+    if not HouseTemplate then
+        return 0
+    end
+
+    local chanceValue =
+        HouseTemplate:FindFirstChild("Chance", true)
+
+    -- Also accept an IntValue named simply "IntValue".
+    if not chanceValue
+        or not chanceValue:IsA("IntValue") then
+
+        for _, object in ipairs(
+            HouseTemplate:GetDescendants()
+        ) do
+
+            if object:IsA("IntValue") then
+                chanceValue = object
+                break
+            end
+
+        end
+
+    end
+
+    if chanceValue and chanceValue:IsA("IntValue") then
+
+        return math.clamp(chanceValue.Value, 0, 100)
+
+    end
+
+    return 0
+
+end
+
+local function TrySpawnHouse(chunkX, chunkZ, tileX, tileZ)
+
+    if not HouseTemplate then
+        return
+    end
+
+    local chunkKey = TileKey(chunkX, chunkZ)
+
+    if AttemptedHouseChunks[chunkKey] then
+        return
+    end
+
+    AttemptedHouseChunks[chunkKey] = true
+
+    local chance = GetHouseChance()
+
+    if chance <= 0 then
+        return
+    end
+
+    local rng = Random.new(
+        MakeSeed(chunkX, chunkZ, 200)
+    )
+
+    -- One spawn chance per 64x64 world area.
+    if rng:NextInteger(1, 100) > chance then
+        return
+    end
+
+    local originX = tileX * STEP_SIZE
+    local originZ = tileZ * STEP_SIZE
+
+    -- Find a suitable flat location.
+    for attempt = 1, 20 do
+
+        local x = originX + rng:NextNumber(2, 14)
+        local z = originZ + rng:NextNumber(2, 14)
+
+        local height, _, biome =
+            GetTerrainData(x, z)
+
+        local suitableBiome =
+            biome == "Plains"
+            or biome == "Forest"
+
+        local h1 = GetTerrainData(x + 5, z)
+        local h2 = GetTerrainData(x, z + 5)
+
+        local flat =
+            math.abs(height - h1) < 5
+            and math.abs(height - h2) < 5
+
+        if suitableBiome
+            and height > SEA_LEVEL + 7
+            and flat then
+
+            PlaceObject(
+                HouseTemplate,
+                GeneratedStructures,
+                x,
+                height,
+                z,
+                rng
+            )
+
+            print(
+                "House spawned in world chunk:",
+                chunkKey
+            )
+
+            return
+
+        end
+
+    end
+
+end
+
+--------------------------------------------------
+-- TERRAIN STEP GENERATION
+--------------------------------------------------
+
+local function GenerateTile(tileX, tileZ)
+
+    local originX = tileX * STEP_SIZE
+    local originZ = tileZ * STEP_SIZE
+
+    local region = Region3.new(
+        Vector3.new(originX, MIN_Y, originZ),
+        Vector3.new(
+            originX + STEP_SIZE,
+            MAX_Y,
+            originZ + STEP_SIZE
+        )
+    ):ExpandToGrid(RESOLUTION)
+
+    local materials = {}
+    local occupancy = {}
+
+    -- Create voxel arrays.
+    for x = 1, VOXELS_X do
+
+        materials[x] = {}
+        occupancy[x] = {}
+
+        for y = 1, VOXELS_Y do
+
+            materials[x][y] = {}
+            occupancy[x][y] = {}
+
+        end
+
+    end
+
+    -- Generate terrain.
+    for x = 1, VOXELS_X do
+
+        for z = 1, VOXELS_Z do
+
+            local worldX =
+                originX + (x - 0.5) * RESOLUTION
+
+            local worldZ =
+                originZ + (z - 0.5) * RESOLUTION
+
+            local surfaceHeight, waterLevel, biome =
+                GetTerrainData(worldX, worldZ)
+
+            for y = 1, VOXELS_Y do
+
+                local worldY =
+                    MIN_Y + (y - 0.5) * RESOLUTION
+
+                local material = Enum.Material.Air
+                local amount = 0
+
+                if worldY <= surfaceHeight then
+
+                    amount = 1
+
+                    local depth = surfaceHeight - worldY
+
+                    if biome == "Ocean"
+                        or biome == "Beach"
+                        or biome == "Lake" then
+
+                        if depth <= 4 then
+
+                            material = Enum.Material.Sand
+
+                        elseif depth <= 20 then
+
+                            material = Enum.Material.Mud
+
+                        else
+
+                            material = Enum.Material.Rock
+
+                        end
+
+                    else
+
+                        if depth <= 4 then
+
+                            material = Enum.Material.Grass
+
+                        elseif depth <= 20 then
+
+                            material = Enum.Material.Mud
+
+                        else
+
+                            material = Enum.Material.Rock
+
+                        end
+
+                    end
+
+                elseif worldY <= waterLevel then
+
+                    material = Enum.Material.Water
+                    amount = 1
+
+                end
+
+                materials[x][y][z] = material
+                occupancy[x][y][z] = amount
+
+            end
+
+        end
+
+    end
+
+    -- Write only this small terrain step.
+    Terrain:WriteVoxels(
+        region,
+        RESOLUTION,
+        materials,
+        occupancy
+    )
+
+    local key = TileKey(tileX, tileZ)
+
+    GeneratedTiles[key] = true
+
+    -- Spawn natural objects.
+    DecorateTrees(tileX, tileZ)
+
+    -- Only the center step of each 64x64 area
+    -- handles its House spawn chance.
+    local chunkX = math.floor(tileX / STEPS_PER_CHUNK)
+    local chunkZ = math.floor(tileZ / STEPS_PER_CHUNK)
+
+    local localX = tileX - chunkX * STEPS_PER_CHUNK
+    local localZ = tileZ - chunkZ * STEPS_PER_CHUNK
+
+    if localX == 2 and localZ == 2 then
+
+        TrySpawnHouse(
+            chunkX,
+            chunkZ,
+            tileX,
+            tileZ
+        )
+
+    end
+
+end
+
+--------------------------------------------------
+-- PLAYER DISTANCE
+--------------------------------------------------
+
+local function GetNearestPlayerDistance(tileX, tileZ)
+
+    local nearest = math.huge
+
+    for _, center in pairs(PlayerCenters) do
+
+        local dx = tileX - center.x
+        local dz = tileZ - center.z
+
+        local distance = dx * dx + dz * dz
+
+        if distance < nearest then
+            nearest = distance
+        end
+
+    end
+
+    return nearest
+
+end
+
+local function IsTileNeeded(tileX, tileZ)
+
+    return GetNearestPlayerDistance(
+        tileX,
+        tileZ
+    ) <= LOAD_RADIUS_STEPS ^ 2
+
+end
+
+--------------------------------------------------
+-- TILE QUEUE
+--------------------------------------------------
+
+local function QueueTile(x, z)
+
+    local key = TileKey(x, z)
+
+    if GeneratedTiles[key]
+        or GeneratingTiles[key]
+        or QueuedTiles[key] then
+
+        return
+
+    end
+
+    QueuedTiles[key] = true
+
+    table.insert(PendingTiles, {
+        x = x,
+        z = z
+    })
+
+end
+
+local function QueueAroundPlayer(centerX, centerZ)
+
+    for x = -LOAD_RADIUS_STEPS, LOAD_RADIUS_STEPS do
+
+        for z = -LOAD_RADIUS_STEPS, LOAD_RADIUS_STEPS do
+
+            if x * x + z * z <= LOAD_RADIUS_STEPS ^ 2 then
+
+                QueueTile(
+                    centerX + x,
+                    centerZ + z
+                )
+
+            end
+
+        end
+
+    end
+
+end
+
+--------------------------------------------------
+-- PRIORITY QUEUE
+--------------------------------------------------
+
+local function GetNextTile()
+
+    -- Remove tiles no longer near any player.
+    for i = #PendingTiles, 1, -1 do
+
+        local tile = PendingTiles[i]
+        local key = TileKey(tile.x, tile.z)
+
+        if not IsTileNeeded(tile.x, tile.z)
+            or GeneratedTiles[key]
+            or GeneratingTiles[key] then
+
+            QueuedTiles[key] = nil
+            table.remove(PendingTiles, i)
+
+        end
+
+    end
+
+    -- Find the closest remaining tile.
+    local bestIndex = nil
+    local bestDistance = math.huge
+
+    for i, tile in ipairs(PendingTiles) do
+
+        local distance = GetNearestPlayerDistance(
+            tile.x,
+            tile.z
+        )
+
+        if distance < bestDistance then
+
+            bestDistance = distance
+            bestIndex = i
+
+        end
+
+    end
+
+    if not bestIndex then
+        return nil
+    end
+
+    local tile = table.remove(PendingTiles, bestIndex)
+
+    QueuedTiles[TileKey(tile.x, tile.z)] = nil
+
+    return tile
+
+end
+
+--------------------------------------------------
+-- GENERATION WORKERS
+--------------------------------------------------
+
+local function Worker()
+
+    while true do
+
+        local tile = GetNextTile()
+
+        if tile then
+
+            local key = TileKey(tile.x, tile.z)
+
+            if not GeneratedTiles[key] then
+
+                GeneratingTiles[key] = true
+
+                local success, err = pcall(
+                    GenerateTile,
+                    tile.x,
+                    tile.z
+                )
+
+                GeneratingTiles[key] = nil
+
+                if not success then
+
+                    warn(
+                        "Terrain step failed:",
+                        key,
+                        err
+                    )
+
+                    if IsTileNeeded(tile.x, tile.z) then
+
+                        task.wait(0.5)
+                        QueueTile(tile.x, tile.z)
+
+                    end
+
+                end
+
+            end
+
+        else
+
+            task.wait(0.03)
+
+        end
+
+    end
+
+end
+
+for i = 1, MAX_WORKERS do
+
+    task.spawn(Worker)
+
+end
+
+--------------------------------------------------
+-- PLAYER MOVEMENT DETECTION
+--------------------------------------------------
+
+Players.PlayerRemoving:Connect(function(player)
+
+    PlayerCenters[player] = nil
+
+end)
+
 while true do
 
-	for _, player in ipairs(Players:GetPlayers()) do
+    for _, player in ipairs(Players:GetPlayers()) do
 
-		UpdatePlayerChunks(player)
+        local character = player.Character
 
-	end
+        local root = character
+            and character:FindFirstChild("HumanoidRootPart")
 
-	task.wait(1)
+        if root then
+
+            local tileX = math.floor(
+                root.Position.X / STEP_SIZE
+            )
+
+            local tileZ = math.floor(
+                root.Position.Z / STEP_SIZE
+            )
+
+            local previous = PlayerCenters[player]
+
+            -- Queue new terrain whenever the player
+            -- crosses a 16-stud step boundary.
+            if not previous
+                or previous.x ~= tileX
+                or previous.z ~= tileZ then
+
+                PlayerCenters[player] = {
+                    x = tileX,
+                    z = tileZ
+                }
+
+                QueueAroundPlayer(tileX, tileZ)
+
+            end
+
+        else
+
+            PlayerCenters[player] = nil
+
+        end
+
+    end
+
+    task.wait(UPDATE_INTERVAL)
 
 end
