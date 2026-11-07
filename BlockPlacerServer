@@ -30,12 +30,39 @@ local Workspace = game:GetService("Workspace")
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
 
-local API_MODULE = ReplicatedStorage:WaitForChild("ZeorinthMenuAPI", 20)
-if not API_MODULE or not API_MODULE:IsA("ModuleScript") then
-    error("[Zeorinth] ReplicatedStorage.ZeorinthMenuAPI ModuleScript is missing.")
-end
+-- Load the backend API in the background. The menu UI must NOT wait
+-- for a ModuleScript or RemoteFunctions before it is displayed.
+local MenuAPI = nil
+local API_LOAD_ERROR = nil
 
-local MenuAPI = require(API_MODULE)
+task.spawn(function()
+    local apiModule = ReplicatedStorage:WaitForChild("ZeorinthMenuAPI", 10)
+
+    if not apiModule or not apiModule:IsA("ModuleScript") then
+        API_LOAD_ERROR = "ZeorinthMenuAPI ModuleScript is missing from ReplicatedStorage."
+        warn("[Zeorinth] " .. API_LOAD_ERROR .. " Menu UI will still load.")
+        return
+    end
+
+    local success, result = pcall(require, apiModule)
+
+    if not success then
+        API_LOAD_ERROR = tostring(result)
+        warn("[Zeorinth] Could not load backend API: " .. API_LOAD_ERROR)
+        return
+    end
+
+    if type(result) ~= "table" or type(result.Call) ~= "function" then
+        API_LOAD_ERROR = "ZeorinthMenuAPI must return a table containing Call()."
+        warn("[Zeorinth] " .. API_LOAD_ERROR)
+        return
+    end
+
+    MenuAPI = result
+    print("[Zeorinth] Backend API loaded.")
+end)
+
+print("[Zeorinth] Main Menu LocalScript started for " .. Player.Name)
 
 --==============================================================
 -- CONFIGURATION
@@ -492,6 +519,10 @@ end
 --==============================================================
 
 local function callBackend(action, ...)
+    if not MenuAPI then
+        return nil, API_LOAD_ERROR or "Backend is still starting. Check that MenuBackend.server.lua and ZeorinthMenuAPI are installed."
+    end
+
     local args = table.pack(...)
     local success, result, apiError = pcall(function()
         return MenuAPI.Call(action, table.unpack(args, 1, args.n))
@@ -1508,6 +1539,8 @@ end)
 
 attachCamera(Workspace.CurrentCamera)
 renderPage()
+
+print("[Zeorinth] Main Menu GUI created successfully.")
 
 print("================================================")
 print("ZEORINTH SANDBOX - MAIN MENU CLIENT v" .. CONFIG.Version)
