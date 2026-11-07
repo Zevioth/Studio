@@ -1,810 +1,699 @@
---[[
-    BLOCK PLACER SERVER
-    Version: 4.0.0
-    Platform: Roblox Studio
 
-    SERVER RESPONSIBILITIES:
-    - Validate placement and deletion requests
-    - Calculate grid positions
-    - Perform server-side raycasts
-    - Create and replicate blocks
-    - Delete blocks
-    - Play global sounds
-    - Spawn break particles
-    - Manage the block grid
-
-    The client cannot directly create or delete blocks.
-]]
-
---// SERVICES
+--==============================================================
+-- ZEORINTH SANDBOX
+-- MENU BACKEND v1.0.0
+--==============================================================
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local StarterPack = game:GetService("StarterPack")
-local TweenService = game:GetService("TweenService")
-local Debris = game:GetService("Debris")
-
---// CONFIGURATION
-
-local TOOL_NAME = "Acacia Block"
-
-local SNAP = 4
-local REACH = 120
-
-local BLOCK_SIZE = Vector3.new(SNAP, SNAP, SNAP)
-
-local ACTION_COOLDOWN = 0.08
-local MAX_CAMERA_OFFSET = 64
-local MAX_BLOCKS = 2000
-
---// SOUNDS
-
-local PLACE_SOUND_IDS = {
-    "rbxassetid://137891923918460",
-    "rbxassetid://137872931202432",
-    "rbxassetid://137851335400766",
-}
-
-local DELETE_SOUND_IDS = {
-    "rbxassetid://137782073700276",
-    "rbxassetid://137280066138423",
-    "rbxassetid://132113571207729",
-}
-
---// TEXTURES
-
-local FACE_TEXTURES = {
-    [Enum.NormalId.Top] =
-        "rbxassetid://9267183930",
-
-    [Enum.NormalId.Bottom] =
-        "rbxassetid://9267089500",
-
-    [Enum.NormalId.Front] =
-        "rbxassetid://9267155972",
-
-    [Enum.NormalId.Back] =
-        "rbxassetid://9267155972",
-
-    [Enum.NormalId.Left] =
-        "rbxassetid://9267155972",
-
-    [Enum.NormalId.Right] =
-        "rbxassetid://9267155972",
-}
-
-local FACE_NAMES = {
-    [Enum.NormalId.Top] = "Top",
-    [Enum.NormalId.Bottom] = "Bottom",
-    [Enum.NormalId.Front] = "Front",
-    [Enum.NormalId.Back] = "Back",
-    [Enum.NormalId.Left] = "Left",
-    [Enum.NormalId.Right] = "Right",
-}
-
-local FACE_TEXTURE_LIST = {}
-
-for _, textureId in pairs(FACE_TEXTURES) do
-    table.insert(FACE_TEXTURE_LIST, textureId)
-end
-
---// REMOTE EVENT
-
-local remote = ReplicatedStorage:FindFirstChild(
-    "BlockPlacerRemote"
-)
-
-if not remote then
-    remote = Instance.new("RemoteEvent")
-    remote.Name = "BlockPlacerRemote"
-    remote.Parent = ReplicatedStorage
-end
-
-assert(
-    remote:IsA("RemoteEvent"),
-    "BlockPlacerRemote must be a RemoteEvent"
-)
-
---// BLOCK FOLDER
-
-local blockFolder = workspace:FindFirstChild(
-    "BlockPlacerBlocks"
-)
-
-if not blockFolder then
-    blockFolder = Instance.new("Folder")
-    blockFolder.Name = "BlockPlacerBlocks"
-    blockFolder.Parent = workspace
-end
-
---// SERVER STATE
-
-local blockGrid = {}
-local playerCooldowns = {}
+local DataStoreService = game:GetService("DataStoreService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
 
 --==============================================================
--- GRID MATH
+-- CONFIGURATION
 --==============================================================
 
-local function snap1(value)
-    return math.floor(value / SNAP + 0.5) * SNAP
-end
+local GAMEPLAY_PLACE_ID = 0 -- REPLACE THIS
 
-local function gridKey(position)
-    return
-        math.floor(position.X / SNAP + 0.5)
-        .. ","
-        .. math.floor(position.Y / SNAP + 0.5)
-        .. ","
-        .. math.floor(position.Z / SNAP + 0.5)
-end
+local MAX_WORLDS_PER_USER = 30
+local MAX_PUBLIC_RESULTS = 25
+local MAX_PLAYERS = 20
 
-local function getBlockAt(position)
-    local key = gridKey(position)
-    local block = blockGrid[key]
-
-    if block and not block.Parent then
-        blockGrid[key] = nil
-        return nil
-    end
-
-    return block
-end
-
-local function registerBlock(block)
-    local key = gridKey(block.Position)
-
-    blockGrid[key] = block
-
-    block.Destroying:Connect(function()
-        if blockGrid[key] == block then
-            blockGrid[key] = nil
-        end
-    end)
-end
+local WORLD_STORE_NAME = "ZS_Worlds_v1"
+local USER_INDEX_NAME = "ZS_UserWorlds_v1"
+local PUBLIC_INDEX_NAME = "ZS_PublicWorlds_v1"
 
 --==============================================================
--- TEXTURES
+-- DATA STORES
 --==============================================================
 
-local function addTextures(part)
+local WorldStore =
+    DataStoreService:GetDataStore(WORLD_STORE_NAME)
 
-    for face, textureId in pairs(FACE_TEXTURES) do
+local UserWorldIndex =
+    DataStoreService:GetDataStore(USER_INDEX_NAME)
 
-        local textureName =
-            "BlockPlacerTexture_" .. FACE_NAMES[face]
+local PublicWorldIndex =
+    DataStoreService:GetOrderedDataStore(PUBLIC_INDEX_NAME)
 
-        local texture = part:FindFirstChild(textureName)
+--==============================================================
+-- REMOTE FUNCTIONS
+--==============================================================
 
-        if not texture then
-            texture = Instance.new("Texture")
-            texture.Name = textureName
-            texture.Parent = part
-        end
+local RemoteFolder =
+    ReplicatedStorage:FindFirstChild("ZeorinthRemotes")
 
-        texture.Texture = textureId
-        texture.Face = face
-
-        texture.StudsPerTileU = 4
-        texture.StudsPerTileV = 4
-    end
+if not RemoteFolder then
+    RemoteFolder = Instance.new("Folder")
+    RemoteFolder.Name = "ZeorinthRemotes"
+    RemoteFolder.Parent = ReplicatedStorage
 end
 
--- Apply textures to the actual Tool Handle too.
+local function createRemote(name)
+    local existing = RemoteFolder:FindFirstChild(name)
 
-local function styleTool(tool)
-
-    if not tool:IsA("Tool") then return end
-    if tool.Name ~= TOOL_NAME then return end
-
-    local handle = tool:FindFirstChild("Handle")
-
-    if handle and handle:IsA("BasePart") then
-
-        handle.CanCollide = false
-        handle.CanTouch = false
-        handle.Massless = true
-
-        addTextures(handle)
-    end
-end
-
-local function watchContainer(container)
-
-    for _, child in ipairs(container:GetChildren()) do
-        styleTool(child)
+    if existing and existing:IsA("RemoteFunction") then
+        return existing
     end
 
-    container.ChildAdded:Connect(styleTool)
-end
-
-watchContainer(StarterPack)
-StarterPack.ChildAdded:Connect(styleTool)
-
-local function setupPlayer(player)
-
-    player:SetAttribute("BlockPlacerLastAction", "None")
-
-    local backpack = player:WaitForChild("Backpack")
-    watchContainer(backpack)
-
-    player.CharacterAdded:Connect(function(character)
-        watchContainer(character)
-    end)
-
-    if player.Character then
-        watchContainer(player.Character)
+    if existing then
+        existing:Destroy()
     end
+
+    local remote = Instance.new("RemoteFunction")
+    remote.Name = name
+    remote.Parent = RemoteFolder
+
+    return remote
 end
 
-Players.PlayerAdded:Connect(function(player)
-    task.spawn(setupPlayer, player)
+local CreateWorld = createRemote("CreateWorld")
+local GetMyWorlds = createRemote("GetMyWorlds")
+local GetPublicWorlds = createRemote("GetPublicWorlds")
+local JoinWorld = createRemote("JoinWorld")
+local QuickJoin = createRemote("QuickJoin")
+
+--==============================================================
+-- REQUEST LIMITING
+--==============================================================
+
+local LastRequests = {}
+
+local function allowedRequest(player, action, cooldown)
+    local userId = player.UserId
+    local now = os.clock()
+
+    LastRequests[userId] = LastRequests[userId] or {}
+
+    local previous = LastRequests[userId][action] or 0
+
+    if now - previous < cooldown then
+        return false
+    end
+
+    LastRequests[userId][action] = now
+
+    return true
+end
+
+Players.PlayerRemoving:Connect(function(player)
+    LastRequests[player.UserId] = nil
 end)
 
-for _, player in ipairs(Players:GetPlayers()) do
-    task.spawn(setupPlayer, player)
+--==============================================================
+-- VALIDATION
+--==============================================================
+
+local ALLOWED_TYPES = {
+    Sandbox = true,
+    Creative = true,
+    Survival = true
+}
+
+local ALLOWED_TAGS = {
+    Building = true,
+    Casual = true,
+    Roleplay = true
+}
+
+local function cleanText(value, maxLength)
+    if typeof(value) ~= "string" then
+        return ""
+    end
+
+    value = string.gsub(value, "%c", "")
+    value = string.gsub(value, "^%s*(.-)%s*$", "%1")
+
+    return string.sub(value, 1, maxLength)
+end
+
+local function makeWorldKey(worldId)
+    return "World_" .. worldId
+end
+
+local function isWorldIdValid(worldId)
+    return typeof(worldId) == "string"
+        and #worldId >= 30
+        and #worldId <= 40
 end
 
 --==============================================================
--- SOUND SYSTEM
+-- STORE HELPERS
 --==============================================================
 
-local function playRandomAt(position, soundIds)
-
-    if #soundIds == 0 then return end
-
-    local emitter = Instance.new("Part")
-
-    emitter.Name = "BlockPlacerSoundEmitter"
-    emitter.Size = Vector3.new(0.2, 0.2, 0.2)
-
-    emitter.Anchored = true
-    emitter.CanCollide = false
-    emitter.CanTouch = false
-    emitter.CanQuery = false
-
-    emitter.Transparency = 1
-    emitter.Position = position
-    emitter.Parent = workspace
-
-    local sound = Instance.new("Sound")
-
-    sound.SoundId = soundIds[
-        math.random(1, #soundIds)
-    ]
-
-    sound.Volume = 1
-    sound.RollOffMaxDistance = 70
-    sound.Parent = emitter
-
-    sound:Play()
-
-    Debris:AddItem(emitter, 4)
-end
-
---==============================================================
--- PLACEMENT CALCULATION
---==============================================================
-
-local function calcPlacementCenter(result)
-
-    local normal = result.Normal
-    local hit = result.Position
-
-    local nx = normal.X
-    local ny = normal.Y
-    local nz = normal.Z
-
-    local absX = math.abs(nx)
-    local absY = math.abs(ny)
-    local absZ = math.abs(nz)
-
-    local hitBlock = result.Instance
-
-    local isOwnedBlock =
-        hitBlock:IsA("BasePart")
-        and hitBlock:GetAttribute("BlockPlacerOwned") == true
-
-    -- HORIZONTAL SURFACE
-
-    if absY >= absX and absY >= absZ then
-
-        local cx
-        local cz
-
-        if isOwnedBlock then
-
-            local ap = hitBlock.Position
-
-            cx = ap.X
-                + math.floor((hit.X - ap.X) / SNAP + 0.5)
-                * SNAP
-
-            cz = ap.Z
-                + math.floor((hit.Z - ap.Z) / SNAP + 0.5)
-                * SNAP
-
-        else
-
-            cx = snap1(hit.X)
-            cz = snap1(hit.Z)
-
-        end
-
-        local cy = hit.Y + ny * SNAP * 0.5
-
-        return Vector3.new(cx, cy, cz)
-
+local function getWorld(worldId)
+    if not isWorldIdValid(worldId) then
+        return nil
     end
 
-    -- SIDE SURFACE
-
-    if isOwnedBlock then
-
-        local ap = hitBlock.Position
-
-        return Vector3.new(
-            ap.X + math.round(nx) * SNAP,
-            ap.Y + math.round(ny) * SNAP,
-            ap.Z + math.round(nz) * SNAP
-        )
-
-    else
-
-        if absX >= absZ then
-
-            return Vector3.new(
-                hit.X + nx * SNAP * 0.5,
-                snap1(hit.Y),
-                snap1(hit.Z)
-            )
-
-        else
-
-            return Vector3.new(
-                snap1(hit.X),
-                snap1(hit.Y),
-                hit.Z + nz * SNAP * 0.5
-            )
-
-        end
-    end
-end
-
---==============================================================
--- PLAYER OVERLAP CHECK
---==============================================================
-
-local function overlapsPlayer(center, character)
-
-    if not character then return false end
-
-    local half = SNAP * 0.5
-
-    for _, part in ipairs(character:GetDescendants()) do
-
-        if part:IsA("BasePart") then
-
-            local difference = part.Position - center
-
-            if math.abs(difference.X) < part.Size.X * 0.5 + half
-            and math.abs(difference.Y) < part.Size.Y * 0.5 + half
-            and math.abs(difference.Z) < part.Size.Z * 0.5 + half then
-
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
---==============================================================
--- BREAK PARTICLES
---==============================================================
-
-local PARTICLE_COUNT = 10
-
-local function randomBetween(minimum, maximum)
-    return minimum + math.random() * (maximum - minimum)
-end
-
-local function spawnBreakParticles(block)
-
-    local origin = block.Position
-
-    for _ = 1, PARTICLE_COUNT do
-
-        local size = randomBetween(0.22, 0.55)
-        local thickness = size * randomBetween(0.25, 0.55)
-
-        local particle = Instance.new("Part")
-
-        local axis = math.random(1, 3)
-
-        if axis == 1 then
-            particle.Size = Vector3.new(
-                thickness, size, size
-            )
-        elseif axis == 2 then
-            particle.Size = Vector3.new(
-                size, thickness, size
-            )
-        else
-            particle.Size = Vector3.new(
-                size, size, thickness
-            )
-        end
-
-        particle.Anchored = false
-        particle.CanCollide = false
-        particle.CanTouch = false
-        particle.CanQuery = false
-        particle.CastShadow = false
-
-        particle.Material = Enum.Material.SmoothPlastic
-        particle.Color = block.Color
-
-        local half = SNAP * 0.5
-
-        particle.CFrame =
-            CFrame.new(
-                origin.X + randomBetween(-half, half),
-                origin.Y + randomBetween(-half, half),
-                origin.Z + randomBetween(-half, half)
-            )
-            * CFrame.Angles(
-                math.random() * math.pi * 2,
-                math.random() * math.pi * 2,
-                math.random() * math.pi * 2
-            )
-
-        local textureId = FACE_TEXTURE_LIST[
-            math.random(1, #FACE_TEXTURE_LIST)
-        ]
-
-        for _, face in ipairs(Enum.NormalId:GetEnumItems()) do
-
-            local texture = Instance.new("Texture")
-
-            texture.Texture = textureId
-            texture.Face = face
-
-            texture.StudsPerTileU = 2
-            texture.StudsPerTileV = 2
-
-            texture.Parent = particle
-        end
-
-        particle.Parent = workspace
-
-        particle.AssemblyLinearVelocity = Vector3.new(
-            randomBetween(-1, 1) * randomBetween(8, 20),
-            randomBetween(5, 15),
-            randomBetween(-1, 1) * randomBetween(8, 20)
-        )
-
-        particle.AssemblyAngularVelocity = Vector3.new(
-            randomBetween(-12, 12),
-            randomBetween(-12, 12),
-            randomBetween(-12, 12)
-        )
-
-        Debris:AddItem(particle, 1.2)
-    end
-end
-
---==============================================================
--- BLOCK CREATION
---==============================================================
-
-local function spawnBlock(player, result, character)
-
-    if not result then return false end
-
-    if #blockFolder:GetChildren() >= MAX_BLOCKS then
-        return false
-    end
-
-    local center = calcPlacementCenter(result)
-
-    -- Prevent duplicate grid positions.
-
-    if getBlockAt(center) then
-        return false
-    end
-
-    -- Prevent placement inside the player.
-
-    if overlapsPlayer(center, character) then
-        return false
-    end
-
-    local block = Instance.new("Part")
-
-    block.Name = "ClientBlock"
-    block.Size = BLOCK_SIZE
-
-    block.Anchored = true
-    block.CanCollide = true
-    block.CanTouch = true
-    block.CanQuery = true
-
-    block.Material = Enum.Material.SmoothPlastic
-    block.BrickColor = BrickColor.new("Bright green")
-
-    block.CFrame = CFrame.new(center)
-
-    block:SetAttribute("BlockPlacerOwned", true)
-    block:SetAttribute("OwnerUserId", player.UserId)
-
-    -- Create immediately on the SERVER.
-
-    block.Parent = blockFolder
-
-    addTextures(block)
-
-    -- FIX M: Grass Type tag.
-
-    local typeValue = Instance.new("StringValue")
-
-    typeValue.Name = "Type"
-    typeValue.Value = "Grass"
-    typeValue.Parent = block
-
-    registerBlock(block)
-
-    playRandomAt(center, PLACE_SOUND_IDS)
-
-    player:SetAttribute("BlockPlacerLastAction", "Place")
-
-    -- Spawn animation.
-
-    block.Size = BLOCK_SIZE * 0.55
-
-    local growTween = TweenService:Create(
-        block,
-        TweenInfo.new(
-            0.13,
-            Enum.EasingStyle.Back,
-            Enum.EasingDirection.Out
-        ),
-        {
-            Size = BLOCK_SIZE * 1.08
-        }
-    )
-
-    growTween:Play()
-
-    growTween.Completed:Connect(function()
-
-        if not block or not block.Parent then
-            return
-        end
-
-        local settleTween = TweenService:Create(
-            block,
-            TweenInfo.new(0.07),
-            {
-                Size = BLOCK_SIZE
-            }
-        )
-
-        settleTween:Play()
+    local success, result = pcall(function()
+        return WorldStore:GetAsync(makeWorldKey(worldId))
     end)
 
-    remote:FireClient(player, "Success", "Place")
-
-    return true
-end
-
---==============================================================
--- BLOCK DELETION
---==============================================================
-
-local function deleteBlock(player, result)
-
-    if not result or not result.Instance then
-        return false
-    end
-
-    local target = result.Instance
-
-    -- Only delete blocks created by this system.
-
-    if not target:IsA("BasePart") then
-        return false
-    end
-
-    if target:GetAttribute("BlockPlacerOwned") ~= true then
-        return false
-    end
-
-    if not target:IsDescendantOf(blockFolder) then
-        return false
-    end
-
-    local position = target.Position
-
-    playRandomAt(position, DELETE_SOUND_IDS)
-
-    spawnBreakParticles(target)
-
-    player:SetAttribute("BlockPlacerLastAction", "Break")
-
-    local breakTween = TweenService:Create(
-        target,
-        TweenInfo.new(
-            0.06,
-            Enum.EasingStyle.Quad,
-            Enum.EasingDirection.In
-        ),
-        {
-            Size = BLOCK_SIZE * 0.05,
-            Transparency = 0.8
-        }
-    )
-
-    breakTween:Play()
-
-    breakTween.Completed:Connect(function()
-
-        if target and target.Parent then
-            target:Destroy()
-        end
-    end)
-
-    remote:FireClient(player, "Success", "Break")
-
-    return true
-end
-
---==============================================================
--- SERVER RAYCAST
---==============================================================
-
-local function getServerRaycast(player, origin, direction)
-
-    local character = player.Character
-
-    if not character then return nil end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local head = character:FindFirstChild("Head")
-
-    if not humanoid or humanoid.Health <= 0 then
+    if not success then
+        warn("[Zeorinth] Failed to load world:", result)
         return nil
-    end
-
-    if not head then return nil end
-
-    if typeof(origin) ~= "Vector3"
-    or typeof(direction) ~= "Vector3" then
-        return nil
-    end
-
-    local directionMagnitude = direction.Magnitude
-
-    if directionMagnitude < 0.5
-    or directionMagnitude > 1.5 then
-        return nil
-    end
-
-    -- Limit how far the supplied camera origin can be
-    -- from the player's actual character.
-
-    if (origin - head.Position).Magnitude > MAX_CAMERA_OFFSET then
-        return nil
-    end
-
-    local params = RaycastParams.new()
-
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { character }
-    params.IgnoreWater = true
-
-    local unitDirection = direction.Unit
-
-    local result = workspace:Raycast(
-        origin,
-        unitDirection * REACH,
-        params
-    )
-
-    -- The actual hit must also be within player reach.
-
-    if result then
-        if (result.Position - head.Position).Magnitude > REACH then
-            return nil
-        end
     end
 
     return result
 end
 
+local function removeFromOwnerIndex(userId, worldId)
+    local success, err = pcall(function()
+        UserWorldIndex:UpdateAsync(
+            "User_" .. tostring(userId),
+            function(current)
+                current = typeof(current) == "table"
+                    and current
+                    or {}
+
+                local updated = {}
+
+                for _, id in ipairs(current) do
+                    if id ~= worldId then
+                        table.insert(updated, id)
+                    end
+                end
+
+                return updated
+            end
+        )
+    end)
+
+    if not success then
+        warn("[Zeorinth] Index rollback failed:", err)
+    end
+end
+
+local function getSafeSummary(world)
+    return {
+        id = world.id,
+        name = world.name,
+        description = world.description,
+        ownerName = world.ownerName,
+
+        ownerId = world.ownerId,
+
+        gameType = world.gameType,
+        visibility = world.visibility,
+
+        maxPlayers = world.maxPlayers,
+        tags = world.tags,
+
+        createdAt = world.createdAt,
+        updatedAt = world.updatedAt
+    }
+end
+
 --==============================================================
--- REMOTE EVENT VALIDATION
+-- OWNER INDEX
 --==============================================================
 
-remote.OnServerEvent:Connect(function(
-    player,
-    action,
-    origin,
-    direction
-)
+local function addToOwnerIndex(userId, worldId)
+    local success, updated = pcall(function()
+        return UserWorldIndex:UpdateAsync(
+            "User_" .. tostring(userId),
 
-    if action ~= "Place" and action ~= "Break" then
-        return
+            function(current)
+                current = typeof(current) == "table"
+                    and current
+                    or {}
+
+                for _, id in ipairs(current) do
+                    if id == worldId then
+                        return current
+                    end
+                end
+
+                if #current >= MAX_WORLDS_PER_USER then
+                    return current
+                end
+
+                table.insert(current, worldId)
+
+                return current
+            end
+        )
+    end)
+
+    if not success then
+        return false, "Could not update your world collection."
     end
 
-    local character = player.Character
-
-    if not character then return end
-
-    -- Tool MUST actually be equipped on the server.
-
-    local equippedTool = character:FindFirstChild(TOOL_NAME)
-
-    if not equippedTool or not equippedTool:IsA("Tool") then
-        return
+    if not table.find(updated or {}, worldId) then
+        return false, "You have reached your world creation limit."
     end
 
-    local handle = equippedTool:FindFirstChild("Handle")
+    return true
+end
 
-    if not handle or not handle:IsA("BasePart") then
-        return
+--==============================================================
+-- PUBLIC WORLD INDEX
+--==============================================================
+
+local function getPublicWorldRecords()
+    local success, pages = pcall(function()
+        return PublicWorldIndex:GetSortedAsync(
+            false,
+            MAX_PUBLIC_RESULTS
+        )
+    end)
+
+    if not success then
+        warn("[Zeorinth] Public index error:", pages)
+
+        return nil, "Could not retrieve public worlds."
     end
 
-    -- Server cooldown.
+    local records = {}
+    local entries = pages:GetCurrentPage()
 
-    local now = os.clock()
+    for _, entry in ipairs(entries) do
+        local world = getWorld(entry.key)
 
-    if not playerCooldowns[player] then
-        playerCooldowns[player] = {
-            Place = 0,
-            Break = 0
+        if world and world.visibility == "Public" then
+            table.insert(records, getSafeSummary(world))
+        end
+    end
+
+    return records
+end
+
+--==============================================================
+-- PERMISSIONS
+--==============================================================
+
+local function canJoin(player, world)
+    if world.visibility == "Public" then
+        return true
+    end
+
+    if world.ownerId == player.UserId then
+        return true
+    end
+
+    local collaborators = world.collaborators or {}
+
+    return collaborators[tostring(player.UserId)] ~= nil
+end
+
+--==============================================================
+-- TELEPORT SYSTEM
+--==============================================================
+
+local function teleportToWorld(player, world)
+    if GAMEPLAY_PLACE_ID <= 0 then
+        return false, "Gameplay Place ID has not been configured."
+    end
+
+    local options = Instance.new("TeleportOptions")
+
+    -- Reuse the permanent reserved-server identifier.
+    options.ReservedServerId = world.reservedServerId
+
+    -- Only transfer the world identifier.
+    -- Never trust this value without checking the DataStore.
+    options:SetTeleportData({
+        worldId = world.id
+    })
+
+    local success, err = pcall(function()
+        TeleportService:TeleportAsync(
+            GAMEPLAY_PLACE_ID,
+            {player},
+            options
+        )
+    end)
+
+    if not success then
+        warn("[Zeorinth] Teleport failed:", err)
+
+        return false, "Teleport failed. Your world is still saved."
+    end
+
+    return true, "Joining world..."
+end
+
+--==============================================================
+-- CREATE WORLD
+--==============================================================
+
+CreateWorld.OnServerInvoke = function(player, payload)
+    if not allowedRequest(player, "CreateWorld", 3) then
+        return {
+            ok = false,
+            message = "Please slow down."
         }
     end
 
-    local cooldowns = playerCooldowns[player]
-
-    if now - cooldowns[action] < ACTION_COOLDOWN then
-        return
+    if typeof(payload) ~= "table" then
+        return {
+            ok = false,
+            message = "Invalid world configuration."
+        }
     end
 
-    cooldowns[action] = now
-
-    -- Server performs the actual raycast.
-
-    local result = getServerRaycast(
-        player,
-        origin,
-        direction
-    )
-
-    if not result then
-        return
+    if GAMEPLAY_PLACE_ID <= 0 then
+        return {
+            ok = false,
+            message = "Configure the Gameplay Place ID first."
+        }
     end
 
-    if action == "Place" then
+    local name = cleanText(payload.name, 32)
+    local description = cleanText(payload.description, 120)
 
-        spawnBlock(player, result, character)
+    local gameType = payload.gameType
+    local visibility = payload.visibility
 
-    elseif action == "Break" then
+    local playerLimit = tonumber(payload.maxPlayers)
 
-        deleteBlock(player, result)
-
+    if name == "" then
+        return {
+            ok = false,
+            message = "World name is required."
+        }
     end
-end)
+
+    if not ALLOWED_TYPES[gameType] then
+        return {
+            ok = false,
+            message = "Invalid game type."
+        }
+    end
+
+    if visibility ~= "Public" and visibility ~= "Private" then
+        return {
+            ok = false,
+            message = "Invalid visibility."
+        }
+    end
+
+    if not playerLimit
+        or playerLimit % 1 ~= 0
+        or playerLimit < 1
+        or playerLimit > MAX_PLAYERS then
+
+        return {
+            ok = false,
+            message = "Player limit must be between 1 and 20."
+        }
+    end
+
+    -- Validate and limit tags.
+
+    local tags = {}
+
+    if typeof(payload.tags) == "table" then
+        for _, tag in ipairs(payload.tags) do
+            if typeof(tag) == "string"
+                and ALLOWED_TAGS[tag]
+                and not table.find(tags, tag) then
+
+                if #tags < 3 then
+                    table.insert(tags, tag)
+                end
+            end
+        end
+    end
+
+    -- Generate identifiers.
+
+    local worldId = HttpService:GenerateGUID(false)
+    local reservedServerId = HttpService:GenerateGUID(false)
+
+    local now = os.time()
+
+    local world = {
+        id = worldId,
+
+        name = name,
+        description = description,
+
+        ownerId = player.UserId,
+        ownerName = player.Name,
+
+        gameType = gameType,
+        visibility = visibility,
+
+        maxPlayers = playerLimit,
+        tags = tags,
+
+        collaborators = {},
+
+        reservedServerId = reservedServerId,
+
+        createdAt = now,
+        updatedAt = now,
+
+        version = 1
+    }
+
+    -- Step 1: Save the world record.
+
+    local saveSuccess, saveError = pcall(function()
+        WorldStore:SetAsync(
+            makeWorldKey(worldId),
+            world
+        )
+    end)
+
+    if not saveSuccess then
+        warn("[Zeorinth] World save failed:", saveError)
+
+        return {
+            ok = false,
+            message = "Could not save the world."
+        }
+    end
+
+    -- Step 2: Add it to the owner's collection.
+
+    local indexSuccess, indexError =
+        addToOwnerIndex(player.UserId, worldId)
+
+    if not indexSuccess then
+        pcall(function()
+            WorldStore:RemoveAsync(makeWorldKey(worldId))
+        end)
+
+        return {
+            ok = false,
+            message = indexError
+        }
+    end
+
+    -- Step 3: Add it to the public index if needed.
+
+    if visibility == "Public" then
+        local publicSuccess, publicError = pcall(function()
+            PublicWorldIndex:SetAsync(worldId, now)
+        end)
+
+        if not publicSuccess then
+            warn("[Zeorinth] Public index failed:", publicError)
+
+            removeFromOwnerIndex(player.UserId, worldId)
+
+            pcall(function()
+                WorldStore:RemoveAsync(makeWorldKey(worldId))
+            end)
+
+            return {
+                ok = false,
+                message = "Could not publish your world. Please try again."
+            }
+        end
+    end
+
+    print("[Zeorinth] Created world:", worldId)
+
+    -- Step 4: Teleport the creator.
+
+    local teleportSuccess, teleportMessage =
+        teleportToWorld(player, world)
+
+    return {
+        ok = true,
+        worldId = worldId,
+        message = teleportMessage,
+        teleported = teleportSuccess
+    }
+end
 
 --==============================================================
--- PLAYER CLEANUP
+-- GET MY WORLDS
 --==============================================================
 
-Players.PlayerRemoving:Connect(function(player)
+GetMyWorlds.OnServerInvoke = function(player)
+    if not allowedRequest(player, "GetMyWorlds", 1) then
+        return {
+            ok = false,
+            message = "Please wait before refreshing."
+        }
+    end
 
-    playerCooldowns[player] = nil
+    local success, ids = pcall(function()
+        return UserWorldIndex:GetAsync(
+            "User_" .. tostring(player.UserId)
+        )
+    end)
 
-end)
+    if not success then
+        return {
+            ok = false,
+            message = "Could not load your worlds."
+        }
+    end
 
-print("[BlockPlacer] Server initialized successfully.")
+    ids = typeof(ids) == "table" and ids or {}
+
+    local worlds = {}
+
+    for index = 1, math.min(#ids, MAX_WORLDS_PER_USER) do
+        local world = getWorld(ids[index])
+
+        if world and world.ownerId == player.UserId then
+            table.insert(worlds, getSafeSummary(world))
+        end
+    end
+
+    return {
+        ok = true,
+        worlds = worlds
+    }
+end
+
+--==============================================================
+-- GET PUBLIC WORLDS
+--==============================================================
+
+GetPublicWorlds.OnServerInvoke = function(player)
+    if not allowedRequest(player, "GetPublicWorlds", 2) then
+        return {
+            ok = false,
+            message = "Please wait before refreshing."
+        }
+    end
+
+    local worlds, err = getPublicWorldRecords()
+
+    if not worlds then
+        return {
+            ok = false,
+            message = err
+        }
+    end
+
+    return {
+        ok = true,
+        worlds = worlds
+    }
+end
+
+--==============================================================
+-- JOIN SPECIFIC WORLD
+--==============================================================
+
+JoinWorld.OnServerInvoke = function(player, worldId)
+    if not allowedRequest(player, "JoinWorld", 2) then
+        return {
+            ok = false,
+            message = "Please wait before trying again."
+        }
+    end
+
+    local world = getWorld(worldId)
+
+    if not world then
+        return {
+            ok = false,
+            message = "World not found."
+        }
+    end
+
+    if not canJoin(player, world) then
+        return {
+            ok = false,
+            message = "You do not have permission to join this world."
+        }
+    end
+
+    local success, message = teleportToWorld(player, world)
+
+    return {
+        ok = success,
+        message = message
+    }
+end
+
+--==============================================================
+-- RANDOM PUBLIC WORLD
+--==============================================================
+
+QuickJoin.OnServerInvoke = function(player)
+    if not allowedRequest(player, "QuickJoin", 3) then
+        return {
+            ok = false,
+            message = "Please wait before trying again."
+        }
+    end
+
+    local worlds, err = getPublicWorldRecords()
+
+    if not worlds then
+        return {
+            ok = false,
+            message = err
+        }
+    end
+
+    if #worlds == 0 then
+        return {
+            ok = false,
+            message = "There are currently no public worlds."
+        }
+    end
+
+    local selected = worlds[math.random(1, #worlds)]
+
+    local world = getWorld(selected.id)
+
+    if not world then
+        return {
+            ok = false,
+            message = "Could not load the selected world."
+        }
+    end
+
+    local success, message = teleportToWorld(player, world)
+
+    return {
+        ok = success,
+        message = message,
+        worldName = world.name
+    }
+end
+
+--==============================================================
+-- TELEPORT ERROR MONITOR
+--==============================================================
+
+TeleportService.TeleportInitFailed:Connect(
+    function(player, result, errorMessage, placeId)
+        warn(
+            "[Zeorinth] Teleport initialization failed:",
+            player.Name,
+            result,
+            errorMessage,
+            placeId
+        )
+    end
+)
+
+print("======================================")
+print("ZEORINTH SANDBOX MENU BACKEND")
+print("Backend initialized.")
+print("Gameplay Place ID:", GAMEPLAY_PLACE_ID)
+print("======================================")
