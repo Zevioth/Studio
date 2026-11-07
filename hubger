@@ -1,0 +1,73 @@
+local Players = game:GetService("Players")
+
+local MAX_HUNGER = 100
+local DRAIN_AMOUNT = 0.5
+
+local function startHungerSystem(player, character)
+    local humanoid = character:WaitForChild("Humanoid")
+
+    local elapsed = 0
+    local currentInterval = nil
+
+    while player.Parent and character.Parent and humanoid.Health > 0 do
+        local dt = task.wait(0.1)
+
+        local moving = humanoid.MoveDirection.Magnitude > 0.05
+        local speed = humanoid.WalkSpeed
+
+        local drainInterval = nil
+
+        if speed >= 20 then
+            drainInterval = 2
+        elseif speed >= 16 then
+            drainInterval = 5
+        end
+
+        if moving and drainInterval then
+            if currentInterval ~= drainInterval then
+                elapsed = 0
+                currentInterval = drainInterval
+            end
+
+            elapsed += dt
+
+            if elapsed >= drainInterval then
+                local hunger = player:GetAttribute("Hunger") or MAX_HUNGER
+
+                if hunger > 0 then
+                    player:SetAttribute(
+                        "Hunger",
+                        math.max(0, hunger - DRAIN_AMOUNT)
+                    )
+                end
+
+                elapsed -= drainInterval
+            end
+        else
+            elapsed = 0
+            currentInterval = nil
+        end
+    end
+end
+
+local function setupPlayer(player)
+    if player:GetAttribute("Hunger") == nil then
+        player:SetAttribute("Hunger", MAX_HUNGER)
+    end
+
+    player:SetAttribute("MaxHunger", MAX_HUNGER)
+
+    player.CharacterAdded:Connect(function(character)
+        task.spawn(startHungerSystem, player, character)
+    end)
+
+    if player.Character then
+        task.spawn(startHungerSystem, player, player.Character)
+    end
+end
+
+Players.PlayerAdded:Connect(setupPlayer)
+
+for _, player in ipairs(Players:GetPlayers()) do
+    setupPlayer(player)
+end
