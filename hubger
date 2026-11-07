@@ -1,73 +1,306 @@
+
+-- INFINITE TERRAIN GENERATOR
+-- Place inside ServerScriptService
+
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
-local MAX_HUNGER = 100
-local DRAIN_AMOUNT = 0.5
+local Terrain = Workspace.Terrain
 
-local function startHungerSystem(player, character)
-    local humanoid = character:WaitForChild("Humanoid")
+-- SETTINGS
+local SEED = 58321
 
-    local elapsed = 0
-    local currentInterval = nil
+local CHUNK_SIZE = 64
+local RESOLUTION = 4
 
-    while player.Parent and character.Parent and humanoid.Health > 0 do
-        local dt = task.wait(0.1)
+local LOAD_RADIUS = 2
 
-        local moving = humanoid.MoveDirection.Magnitude > 0.05
-        local speed = humanoid.WalkSpeed
+local MIN_Y = -64
+local MAX_Y = 192
 
-        local drainInterval = nil
+local SEA_LEVEL = 24
 
-        if speed >= 20 then
-            drainInterval = 2
-        elseif speed >= 16 then
-            drainInterval = 5
-        end
+local VOXELS = CHUNK_SIZE / RESOLUTION
+local HEIGHT_VOXELS = (MAX_Y - MIN_Y) / RESOLUTION
 
-        if moving and drainInterval then
-            if currentInterval ~= drainInterval then
-                elapsed = 0
-                currentInterval = drainInterval
-            end
+-- CHUNK STORAGE
+local GeneratedChunks = {}
 
-            elapsed += dt
-
-            if elapsed >= drainInterval then
-                local hunger = player:GetAttribute("Hunger") or MAX_HUNGER
-
-                if hunger > 0 then
-                    player:SetAttribute(
-                        "Hunger",
-                        math.max(0, hunger - DRAIN_AMOUNT)
-                    )
-                end
-
-                elapsed -= drainInterval
-            end
-        else
-            elapsed = 0
-            currentInterval = nil
-        end
-    end
+-- NOISE
+local function noise(x, z, scale, offset)
+	return math.noise(
+		x / scale,
+		z / scale,
+		SEED * 0.001 + offset
+	)
 end
 
-local function setupPlayer(player)
-    if player:GetAttribute("Hunger") == nil then
-        player:SetAttribute("Hunger", MAX_HUNGER)
-    end
+-- TERRAIN HEIGHT AND BIOME
+local function GetTerrainData(x, z)
 
-    player:SetAttribute("MaxHunger", MAX_HUNGER)
+	local continent = noise(x, z, 900, 1)
+	local detail = noise(x, z, 180, 2)
+	local biomeNoise = noise(x, z, 600, 3)
 
-    player.CharacterAdded:Connect(function(character)
-        task.spawn(startHungerSystem, player, character)
-    end)
+	local mountainNoise = noise(x, z, 450, 4)
 
-    if player.Character then
-        task.spawn(startHungerSystem, player, player.Character)
-    end
+	local height
+	local waterLevel = SEA_LEVEL
+	local biome
+
+	-- OCEAN
+	if continent < -0.15 then
+
+		height = 6 + (continent + 0.15) * 35
+		height += detail * 4
+
+		biome = "Ocean"
+
+	else
+
+		-- LAND
+		height = 24 + (continent + 0.15) * 55
+		height += detail * 10
+
+		-- MOUNTAINS
+		if mountainNoise > 0.35 then
+
+			local mountainStrength =
+				(mountainNoise - 0.35) / 0.65
+
+			height += (mountainStrength ^ 2) * 95
+
+			biome = "Mountains"
+
+		-- FORESTS
+		elseif biomeNoise > 0.25 then
+
+			biome = "BigForest"
+			height += detail * 5
+
+		elseif biomeNoise > -0.15 then
+
+			biome = "Forest"
+
+		else
+
+			biome = "Plains"
+
+		end
+
+		-- RARE LAKES
+		local lakeNoise = noise(x, z, 300, 10)
+		local lakeDetail = noise(x, z, 90, 11)
+
+		if lakeNoise > 0.82
+			and continent > 0.05
+			and lakeDetail > 0.15 then
+
+			height = 12 + lakeDetail * 2
+			waterLevel = 22
+
+			biome = "Lake"
+
+		end
+
+	end
+
+	-- BEACHES
+	if biome ~= "Ocean"
+		and biome ~= "Lake"
+		and height >= SEA_LEVEL - 3
+		and height <= SEA_LEVEL + 7 then
+
+		biome = "Beach"
+
+	end
+
+	height = math.clamp(height, MIN_Y, MAX_Y - 8)
+
+	return height, waterLevel, biome
 end
 
-Players.PlayerAdded:Connect(setupPlayer)
+-- GENERATE CHUNK
+local function GenerateChunk(chunkX, chunkZ)
 
-for _, player in ipairs(Players:GetPlayers()) do
-    setupPlayer(player)
+	local key = chunkX .. "," .. chunkZ
+
+	if GeneratedChunks[key] then
+		return
+	end
+
+	GeneratedChunks[key] = "Generating"
+
+	local originX = chunkX * CHUNK_SIZE
+	local originZ = chunkZ * CHUNK_SIZE
+
+	local region = Region3.new(
+		Vector3.new(originX, MIN_Y, originZ),
+		Vector3.new(
+			originX + CHUNK_SIZE,
+			MAX_Y,
+			originZ + CHUNK_SIZE
+		)
+	):ExpandToGrid(RESOLUTION)
+
+	local materials = {}
+	local occupancy = {}
+
+	-- CREATE VOXEL ARRAYS
+	for x = 1, VOXELS do
+
+		materials[x] = {}
+		occupancy[x] = {}
+
+		for y = 1, HEIGHT_VOXELS do
+
+			materials[x][y] = {}
+			occupancy[x][y] = {}
+
+		end
+	end
+
+	-- GENERATE TERRAIN
+	for x = 1, VOXELS do
+
+		for z = 1, VOXELS do
+
+			local worldX = originX + (x - 0.5) * RESOLUTION
+			local worldZ = originZ + (z - 0.5) * RESOLUTION
+
+			local surfaceHeight, waterLevel, biome =
+				GetTerrainData(worldX, worldZ)
+
+			local underwater =
+				surfaceHeight < waterLevel
+
+			for y = 1, HEIGHT_VOXELS do
+
+				local worldY =
+					MIN_Y + (y - 0.5) * RESOLUTION
+
+				local material = Enum.Material.Air
+				local amount = 0
+
+				if worldY <= surfaceHeight then
+
+					local depth = surfaceHeight - worldY
+
+					amount = 1
+
+					if biome == "Beach"
+						or biome == "Ocean"
+						or biome == "Lake" then
+
+						if depth <= 4 then
+							material = Enum.Material.Sand
+						elseif depth <= 16 then
+							material = Enum.Material.Mud
+						else
+							material = Enum.Material.Rock
+						end
+
+					else
+
+						if depth <= 4 then
+							material = Enum.Material.Ground
+						elseif depth <= 16 then
+							material = Enum.Material.Mud
+						else
+							material = Enum.Material.Rock
+						end
+
+					end
+
+				elseif underwater and worldY <= waterLevel then
+
+					material = Enum.Material.Water
+					amount = 1
+
+				end
+
+				materials[x][y][z] = material
+				occupancy[x][y][z] = amount
+
+			end
+		end
+
+		-- Prevent excessive generation spikes
+		if x % 4 == 0 then
+			task.wait()
+		end
+	end
+
+	-- WRITE TERRAIN
+	local success, err = pcall(function()
+
+		Terrain:WriteVoxels(
+			region,
+			RESOLUTION,
+			materials,
+			occupancy
+		)
+
+	end)
+
+	if success then
+
+		GeneratedChunks[key] = true
+
+	else
+
+		GeneratedChunks[key] = nil
+		warn("Chunk generation failed:", key, err)
+
+	end
+
+end
+
+-- PLAYER CHUNK LOADING
+local function UpdatePlayerChunks(player)
+
+	local character = player.Character
+	if not character then return end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local chunkX = math.floor(root.Position.X / CHUNK_SIZE)
+	local chunkZ = math.floor(root.Position.Z / CHUNK_SIZE)
+
+	for x = -LOAD_RADIUS, LOAD_RADIUS do
+
+		for z = -LOAD_RADIUS, LOAD_RADIUS do
+
+			local targetX = chunkX + x
+			local targetZ = chunkZ + z
+
+			local key = targetX .. "," .. targetZ
+
+			if not GeneratedChunks[key] then
+
+				task.spawn(
+					GenerateChunk,
+					targetX,
+					targetZ
+				)
+
+			end
+
+		end
+	end
+
+end
+
+-- MAIN LOOP
+while true do
+
+	for _, player in ipairs(Players:GetPlayers()) do
+
+		UpdatePlayerChunks(player)
+
+	end
+
+	task.wait(1)
+
 end
