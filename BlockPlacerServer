@@ -1,284 +1,35 @@
 
 --==============================================================
 -- ZEORINTH SANDBOX
--- MENU BACKEND v1.0.0
+-- GAMEPLAY WORLD LOADER v1.0.0
 --==============================================================
 
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local DataStoreService = game:GetService("DataStoreService")
-local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
 
 --==============================================================
 -- CONFIGURATION
 --==============================================================
 
-local GAMEPLAY_PLACE_ID = 0 -- REPLACE THIS
-
-local MAX_WORLDS_PER_USER = 30
-local MAX_PUBLIC_RESULTS = 25
-local MAX_PLAYERS = 20
-
 local WORLD_STORE_NAME = "ZS_Worlds_v1"
-local USER_INDEX_NAME = "ZS_UserWorlds_v1"
-local PUBLIC_INDEX_NAME = "ZS_PublicWorlds_v1"
-
---==============================================================
--- DATA STORES
---==============================================================
 
 local WorldStore =
     DataStoreService:GetDataStore(WORLD_STORE_NAME)
 
-local UserWorldIndex =
-    DataStoreService:GetDataStore(USER_INDEX_NAME)
+local MAX_PLAYERS = 20
 
-local PublicWorldIndex =
-    DataStoreService:GetOrderedDataStore(PUBLIC_INDEX_NAME)
+-- Disable automatic spawning until the world is loaded.
 
---==============================================================
--- REMOTE FUNCTIONS
---==============================================================
-
-local RemoteFolder =
-    ReplicatedStorage:FindFirstChild("ZeorinthRemotes")
-
-if not RemoteFolder then
-    RemoteFolder = Instance.new("Folder")
-    RemoteFolder.Name = "ZeorinthRemotes"
-    RemoteFolder.Parent = ReplicatedStorage
-end
-
-local function createRemote(name)
-    local existing = RemoteFolder:FindFirstChild(name)
-
-    if existing and existing:IsA("RemoteFunction") then
-        return existing
-    end
-
-    if existing then
-        existing:Destroy()
-    end
-
-    local remote = Instance.new("RemoteFunction")
-    remote.Name = name
-    remote.Parent = RemoteFolder
-
-    return remote
-end
-
-local CreateWorld = createRemote("CreateWorld")
-local GetMyWorlds = createRemote("GetMyWorlds")
-local GetPublicWorlds = createRemote("GetPublicWorlds")
-local JoinWorld = createRemote("JoinWorld")
-local QuickJoin = createRemote("QuickJoin")
+Players.CharacterAutoLoads = false
 
 --==============================================================
--- REQUEST LIMITING
+-- WORLD STATE
 --==============================================================
 
-local LastRequests = {}
-
-local function allowedRequest(player, action, cooldown)
-    local userId = player.UserId
-    local now = os.clock()
-
-    LastRequests[userId] = LastRequests[userId] or {}
-
-    local previous = LastRequests[userId][action] or 0
-
-    if now - previous < cooldown then
-        return false
-    end
-
-    LastRequests[userId][action] = now
-
-    return true
-end
-
-Players.PlayerRemoving:Connect(function(player)
-    LastRequests[player.UserId] = nil
-end)
-
---==============================================================
--- VALIDATION
---==============================================================
-
-local ALLOWED_TYPES = {
-    Sandbox = true,
-    Creative = true,
-    Survival = true
-}
-
-local ALLOWED_TAGS = {
-    Building = true,
-    Casual = true,
-    Roleplay = true
-}
-
-local function cleanText(value, maxLength)
-    if typeof(value) ~= "string" then
-        return ""
-    end
-
-    value = string.gsub(value, "%c", "")
-    value = string.gsub(value, "^%s*(.-)%s*$", "%1")
-
-    return string.sub(value, 1, maxLength)
-end
-
-local function makeWorldKey(worldId)
-    return "World_" .. worldId
-end
-
-local function isWorldIdValid(worldId)
-    return typeof(worldId) == "string"
-        and #worldId >= 30
-        and #worldId <= 40
-end
-
---==============================================================
--- STORE HELPERS
---==============================================================
-
-local function getWorld(worldId)
-    if not isWorldIdValid(worldId) then
-        return nil
-    end
-
-    local success, result = pcall(function()
-        return WorldStore:GetAsync(makeWorldKey(worldId))
-    end)
-
-    if not success then
-        warn("[Zeorinth] Failed to load world:", result)
-        return nil
-    end
-
-    return result
-end
-
-local function removeFromOwnerIndex(userId, worldId)
-    local success, err = pcall(function()
-        UserWorldIndex:UpdateAsync(
-            "User_" .. tostring(userId),
-            function(current)
-                current = typeof(current) == "table"
-                    and current
-                    or {}
-
-                local updated = {}
-
-                for _, id in ipairs(current) do
-                    if id ~= worldId then
-                        table.insert(updated, id)
-                    end
-                end
-
-                return updated
-            end
-        )
-    end)
-
-    if not success then
-        warn("[Zeorinth] Index rollback failed:", err)
-    end
-end
-
-local function getSafeSummary(world)
-    return {
-        id = world.id,
-        name = world.name,
-        description = world.description,
-        ownerName = world.ownerName,
-
-        ownerId = world.ownerId,
-
-        gameType = world.gameType,
-        visibility = world.visibility,
-
-        maxPlayers = world.maxPlayers,
-        tags = world.tags,
-
-        createdAt = world.createdAt,
-        updatedAt = world.updatedAt
-    }
-end
-
---==============================================================
--- OWNER INDEX
---==============================================================
-
-local function addToOwnerIndex(userId, worldId)
-    local success, updated = pcall(function()
-        return UserWorldIndex:UpdateAsync(
-            "User_" .. tostring(userId),
-
-            function(current)
-                current = typeof(current) == "table"
-                    and current
-                    or {}
-
-                for _, id in ipairs(current) do
-                    if id == worldId then
-                        return current
-                    end
-                end
-
-                if #current >= MAX_WORLDS_PER_USER then
-                    return current
-                end
-
-                table.insert(current, worldId)
-
-                return current
-            end
-        )
-    end)
-
-    if not success then
-        return false, "Could not update your world collection."
-    end
-
-    if not table.find(updated or {}, worldId) then
-        return false, "You have reached your world creation limit."
-    end
-
-    return true
-end
-
---==============================================================
--- PUBLIC WORLD INDEX
---==============================================================
-
-local function getPublicWorldRecords()
-    local success, pages = pcall(function()
-        return PublicWorldIndex:GetSortedAsync(
-            false,
-            MAX_PUBLIC_RESULTS
-        )
-    end)
-
-    if not success then
-        warn("[Zeorinth] Public index error:", pages)
-
-        return nil, "Could not retrieve public worlds."
-    end
-
-    local records = {}
-    local entries = pages:GetCurrentPage()
-
-    for _, entry in ipairs(entries) do
-        local world = getWorld(entry.key)
-
-        if world and world.visibility == "Public" then
-            table.insert(records, getSafeSummary(world))
-        end
-    end
-
-    return records
-end
+local ActiveWorld = nil
+local WorldGenerated = false
 
 --==============================================================
 -- PERMISSIONS
@@ -299,401 +50,242 @@ local function canJoin(player, world)
 end
 
 --==============================================================
--- TELEPORT SYSTEM
+-- GENERATE FLAT WORLD
 --==============================================================
 
-local function teleportToWorld(player, world)
-    if GAMEPLAY_PLACE_ID <= 0 then
-        return false, "Gameplay Place ID has not been configured."
+local function generateWorld(world)
+    if WorldGenerated then
+        return
     end
 
-    local options = Instance.new("TeleportOptions")
+    WorldGenerated = true
 
-    -- Reuse the permanent reserved-server identifier.
-    options.ReservedServerId = world.reservedServerId
+    -- Remove previous generated environment.
 
-    -- Only transfer the world identifier.
-    -- Never trust this value without checking the DataStore.
-    options:SetTeleportData({
-        worldId = world.id
-    })
+    local previous = workspace:FindFirstChild("ZeorinthWorld")
 
-    local success, err = pcall(function()
-        TeleportService:TeleportAsync(
-            GAMEPLAY_PLACE_ID,
-            {player},
-            options
-        )
+    if previous then
+        previous:Destroy()
+    end
+
+    -- Root folder.
+
+    local folder = Instance.new("Folder")
+    folder.Name = "ZeorinthWorld"
+    folder.Parent = workspace
+
+    -- Flat terrain.
+
+    local ground = Instance.new("Part")
+
+    ground.Name = "Ground"
+    ground.Anchored = true
+
+    ground.Size = Vector3.new(512, 2, 512)
+    ground.Position = Vector3.new(0, -1, 0)
+
+    ground.Material = Enum.Material.Grass
+    ground.Color = Color3.fromRGB(111, 178, 102)
+
+    ground.TopSurface = Enum.SurfaceType.Smooth
+    ground.BottomSurface = Enum.SurfaceType.Smooth
+
+    ground.Parent = folder
+
+    -- World spawn.
+
+    local spawn = Instance.new("SpawnLocation")
+
+    spawn.Name = "WorldSpawn"
+
+    spawn.Anchored = true
+    spawn.Neutral = true
+
+    spawn.AllowTeamChangeOnTouch = false
+
+    spawn.Size = Vector3.new(12, 1, 12)
+    spawn.Position = Vector3.new(0, 0.5, 0)
+
+    spawn.Material = Enum.Material.SmoothPlastic
+    spawn.Color = Color3.fromRGB(83, 145, 224)
+
+    spawn.Parent = folder
+
+    -- Lighting.
+
+    Lighting.ClockTime = 14
+    Lighting.Brightness = 2
+
+    Lighting.Ambient = Color3.fromRGB(150, 150, 150)
+    Lighting.OutdoorAmbient = Color3.fromRGB(185, 185, 185)
+
+    workspace.FallenPartsDestroyHeight = -100
+
+    -- Metadata accessible to server scripts.
+
+    workspace:SetAttribute("WorldId", world.id)
+    workspace:SetAttribute("WorldName", world.name)
+    workspace:SetAttribute("WorldType", world.gameType)
+
+    print("[Zeorinth] Generated flat world:", world.name)
+end
+
+--==============================================================
+-- LOAD WORLD RECORD
+--==============================================================
+
+local function loadWorldForPlayer(player)
+    local joinData = player:GetJoinData()
+    local teleportData = joinData and joinData.TeleportData
+
+    -- Studio preview mode.
+    -- Normal published gameplay requires valid teleport data.
+
+    if RunService:IsStudio() and not teleportData then
+        return {
+            id = "STUDIO_PREVIEW",
+            name = "Studio Preview",
+
+            ownerId = player.UserId,
+            ownerName = player.Name,
+
+            visibility = "Public",
+            gameType = "Sandbox",
+
+            maxPlayers = MAX_PLAYERS,
+            collaborators = {},
+
+            reservedServerId = ""
+        }
+    end
+
+    if typeof(teleportData) ~= "table" then
+        return nil, "Missing world information."
+    end
+
+    local worldId = teleportData.worldId
+
+    if typeof(worldId) ~= "string"
+        or #worldId < 30
+        or #worldId > 40 then
+
+        return nil, "Invalid world identifier."
+    end
+
+    local success, world = pcall(function()
+        return WorldStore:GetAsync("World_" .. worldId)
     end)
 
     if not success then
-        warn("[Zeorinth] Teleport failed:", err)
-
-        return false, "Teleport failed. Your world is still saved."
+        warn("[Zeorinth] DataStore error:", world)
+        return nil, "Could not load your world."
     end
 
-    return true, "Joining world..."
-end
-
---==============================================================
--- CREATE WORLD
---==============================================================
-
-CreateWorld.OnServerInvoke = function(player, payload)
-    if not allowedRequest(player, "CreateWorld", 3) then
-        return {
-            ok = false,
-            message = "Please slow down."
-        }
-    end
-
-    if typeof(payload) ~= "table" then
-        return {
-            ok = false,
-            message = "Invalid world configuration."
-        }
-    end
-
-    if GAMEPLAY_PLACE_ID <= 0 then
-        return {
-            ok = false,
-            message = "Configure the Gameplay Place ID first."
-        }
-    end
-
-    local name = cleanText(payload.name, 32)
-    local description = cleanText(payload.description, 120)
-
-    local gameType = payload.gameType
-    local visibility = payload.visibility
-
-    local playerLimit = tonumber(payload.maxPlayers)
-
-    if name == "" then
-        return {
-            ok = false,
-            message = "World name is required."
-        }
-    end
-
-    if not ALLOWED_TYPES[gameType] then
-        return {
-            ok = false,
-            message = "Invalid game type."
-        }
-    end
-
-    if visibility ~= "Public" and visibility ~= "Private" then
-        return {
-            ok = false,
-            message = "Invalid visibility."
-        }
-    end
-
-    if not playerLimit
-        or playerLimit % 1 ~= 0
-        or playerLimit < 1
-        or playerLimit > MAX_PLAYERS then
-
-        return {
-            ok = false,
-            message = "Player limit must be between 1 and 20."
-        }
-    end
-
-    -- Validate and limit tags.
-
-    local tags = {}
-
-    if typeof(payload.tags) == "table" then
-        for _, tag in ipairs(payload.tags) do
-            if typeof(tag) == "string"
-                and ALLOWED_TAGS[tag]
-                and not table.find(tags, tag) then
-
-                if #tags < 3 then
-                    table.insert(tags, tag)
-                end
-            end
-        end
-    end
-
-    -- Generate identifiers.
-
-    local worldId = HttpService:GenerateGUID(false)
-    local reservedServerId = HttpService:GenerateGUID(false)
-
-    local now = os.time()
-
-    local world = {
-        id = worldId,
-
-        name = name,
-        description = description,
-
-        ownerId = player.UserId,
-        ownerName = player.Name,
-
-        gameType = gameType,
-        visibility = visibility,
-
-        maxPlayers = playerLimit,
-        tags = tags,
-
-        collaborators = {},
-
-        reservedServerId = reservedServerId,
-
-        createdAt = now,
-        updatedAt = now,
-
-        version = 1
-    }
-
-    -- Step 1: Save the world record.
-
-    local saveSuccess, saveError = pcall(function()
-        WorldStore:SetAsync(
-            makeWorldKey(worldId),
-            world
-        )
-    end)
-
-    if not saveSuccess then
-        warn("[Zeorinth] World save failed:", saveError)
-
-        return {
-            ok = false,
-            message = "Could not save the world."
-        }
-    end
-
-    -- Step 2: Add it to the owner's collection.
-
-    local indexSuccess, indexError =
-        addToOwnerIndex(player.UserId, worldId)
-
-    if not indexSuccess then
-        pcall(function()
-            WorldStore:RemoveAsync(makeWorldKey(worldId))
-        end)
-
-        return {
-            ok = false,
-            message = indexError
-        }
-    end
-
-    -- Step 3: Add it to the public index if needed.
-
-    if visibility == "Public" then
-        local publicSuccess, publicError = pcall(function()
-            PublicWorldIndex:SetAsync(worldId, now)
-        end)
-
-        if not publicSuccess then
-            warn("[Zeorinth] Public index failed:", publicError)
-
-            removeFromOwnerIndex(player.UserId, worldId)
-
-            pcall(function()
-                WorldStore:RemoveAsync(makeWorldKey(worldId))
-            end)
-
-            return {
-                ok = false,
-                message = "Could not publish your world. Please try again."
-            }
-        end
-    end
-
-    print("[Zeorinth] Created world:", worldId)
-
-    -- Step 4: Teleport the creator.
-
-    local teleportSuccess, teleportMessage =
-        teleportToWorld(player, world)
-
-    return {
-        ok = true,
-        worldId = worldId,
-        message = teleportMessage,
-        teleported = teleportSuccess
-    }
-end
-
---==============================================================
--- GET MY WORLDS
---==============================================================
-
-GetMyWorlds.OnServerInvoke = function(player)
-    if not allowedRequest(player, "GetMyWorlds", 1) then
-        return {
-            ok = false,
-            message = "Please wait before refreshing."
-        }
-    end
-
-    local success, ids = pcall(function()
-        return UserWorldIndex:GetAsync(
-            "User_" .. tostring(player.UserId)
-        )
-    end)
-
-    if not success then
-        return {
-            ok = false,
-            message = "Could not load your worlds."
-        }
-    end
-
-    ids = typeof(ids) == "table" and ids or {}
-
-    local worlds = {}
-
-    for index = 1, math.min(#ids, MAX_WORLDS_PER_USER) do
-        local world = getWorld(ids[index])
-
-        if world and world.ownerId == player.UserId then
-            table.insert(worlds, getSafeSummary(world))
-        end
-    end
-
-    return {
-        ok = true,
-        worlds = worlds
-    }
-end
-
---==============================================================
--- GET PUBLIC WORLDS
---==============================================================
-
-GetPublicWorlds.OnServerInvoke = function(player)
-    if not allowedRequest(player, "GetPublicWorlds", 2) then
-        return {
-            ok = false,
-            message = "Please wait before refreshing."
-        }
-    end
-
-    local worlds, err = getPublicWorldRecords()
-
-    if not worlds then
-        return {
-            ok = false,
-            message = err
-        }
-    end
-
-    return {
-        ok = true,
-        worlds = worlds
-    }
-end
-
---==============================================================
--- JOIN SPECIFIC WORLD
---==============================================================
-
-JoinWorld.OnServerInvoke = function(player, worldId)
-    if not allowedRequest(player, "JoinWorld", 2) then
-        return {
-            ok = false,
-            message = "Please wait before trying again."
-        }
-    end
-
-    local world = getWorld(worldId)
-
-    if not world then
-        return {
-            ok = false,
-            message = "World not found."
-        }
+    if typeof(world) ~= "table" then
+        return nil, "This world no longer exists."
     end
 
     if not canJoin(player, world) then
-        return {
-            ok = false,
-            message = "You do not have permission to join this world."
-        }
+        return nil, "You do not have permission to access this world."
     end
 
-    local success, message = teleportToWorld(player, world)
+    -- Verify that the current server belongs to this world.
 
-    return {
-        ok = success,
-        message = message
-    }
+    if not RunService:IsStudio() then
+        if game.PrivateServerId ~= world.reservedServerId then
+            return nil, "Invalid world server."
+        end
+    end
+
+    return world
 end
 
 --==============================================================
--- RANDOM PUBLIC WORLD
+-- PLAYER INITIALIZATION
 --==============================================================
 
-QuickJoin.OnServerInvoke = function(player)
-    if not allowedRequest(player, "QuickJoin", 3) then
-        return {
-            ok = false,
-            message = "Please wait before trying again."
-        }
-    end
-
-    local worlds, err = getPublicWorldRecords()
-
-    if not worlds then
-        return {
-            ok = false,
-            message = err
-        }
-    end
-
-    if #worlds == 0 then
-        return {
-            ok = false,
-            message = "There are currently no public worlds."
-        }
-    end
-
-    local selected = worlds[math.random(1, #worlds)]
-
-    local world = getWorld(selected.id)
+local function initializePlayer(player)
+    local world, errorMessage = loadWorldForPlayer(player)
 
     if not world then
-        return {
-            ok = false,
-            message = "Could not load the selected world."
-        }
+        player:Kick(
+            "Zeorinth Sandbox\n" ..
+            tostring(errorMessage or "Unable to load world.")
+        )
+
+        return
     end
 
-    local success, message = teleportToWorld(player, world)
+    -- A reserved server should only host one world.
 
-    return {
-        ok = success,
-        message = message,
-        worldName = world.name
-    }
+    if ActiveWorld and ActiveWorld.id ~= world.id then
+        player:Kick("This server belongs to another world.")
+        return
+    end
+
+    ActiveWorld = ActiveWorld or world
+
+    -- Player capacity check.
+
+    if #Players:GetPlayers() > world.maxPlayers then
+        player:Kick("This world has reached its player limit.")
+        return
+    end
+
+    -- Set player information.
+
+    player:SetAttribute("WorldId", world.id)
+
+    if world.ownerId == player.UserId then
+        player:SetAttribute("WorldRole", "Owner")
+    else
+        player:SetAttribute("WorldRole", "Visitor")
+    end
+
+    -- Generate the environment once.
+
+    generateWorld(ActiveWorld)
+
+    -- Spawn the character after the environment exists.
+
+    local success, err = pcall(function()
+        player:LoadCharacterAsync()
+    end)
+
+    if not success then
+        warn("[Zeorinth] Character loading failed:", err)
+    end
+
+    print(
+        "[Zeorinth] Player loaded:",
+        player.Name,
+        "World:",
+        world.name
+    )
+end
+
+Players.PlayerAdded:Connect(function(player)
+    task.spawn(initializePlayer, player)
+end)
+
+-- Handle players already in the server.
+
+for _, player in ipairs(Players:GetPlayers()) do
+    task.spawn(initializePlayer, player)
 end
 
 --==============================================================
--- TELEPORT ERROR MONITOR
+-- PLAYER REMOVAL
 --==============================================================
 
-TeleportService.TeleportInitFailed:Connect(
-    function(player, result, errorMessage, placeId)
-        warn(
-            "[Zeorinth] Teleport initialization failed:",
-            player.Name,
-            result,
-            errorMessage,
-            placeId
-        )
-    end
-)
+Players.PlayerRemoving:Connect(function(player)
+    print(
+        "[Zeorinth] Player left:",
+        player.Name
+    )
+end)
 
 print("======================================")
-print("ZEORINTH SANDBOX MENU BACKEND")
-print("Backend initialized.")
-print("Gameplay Place ID:", GAMEPLAY_PLACE_ID)
+print("ZEORINTH SANDBOX GAMEPLAY BACKEND")
+print("World loader initialized.")
 print("======================================")
